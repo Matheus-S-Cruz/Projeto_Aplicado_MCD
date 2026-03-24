@@ -2,118 +2,111 @@ import pandas as pd
 import requests
 import time
 
+# =========================
+# CONFIGURAÇÃO
+# =========================
 ARQUIVO_ENTRADA = "dados_brutos/IDENTIFICACAO.xlsx"
 ARQUIVO_SAIDA = "compostos_enriquecidos.xlsx"
 
 # =========================
-# PUBCHEM
+# BUSCA POR MASSA (PUBCHEM)
 # =========================
-def buscar_pubchem(nome_composto):
-    try:
-        nome_formatado = str(nome_composto).replace(" ", "%20")
+def buscar_pubchem_por_massa(massa, tentativas=2):
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/"
+        f"fastformula/{massa}/property/"
+        f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+    )
 
-        url = (
-            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-            f"{nome_formatado}/property/"
-            f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
-        )
+    for tentativa in range(tentativas):
+        try:
+            print(f"   🌐 Tentativa {tentativa+1}...")
 
-        response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=5)
 
-        if response.status_code != 200:
+            if response.status_code != 200:
+                print("   ❌ Massa não encontrada")
+                return None
+
+            data = response.json()
+            props = data["PropertyTable"]["Properties"][0]
+
+            print("   ✅ Encontrado por massa!")
+
+            return {
+                "cid": props.get("CID"),
+                "formula": props.get("MolecularFormula"),
+                "massa": props.get("MolecularWeight"),
+                "iupac": props.get("IUPACName"),
+            }
+
+        except requests.exceptions.Timeout:
+            print("   ⏱️ Timeout! Tentando novamente...")
+
+        except Exception as e:
+            print(f"   ⚠️ Erro: {e}")
             return None
 
-        data = response.json()
-        props = data["PropertyTable"]["Properties"][0]
-
-        return {
-            "cid": props.get("CID"),
-            "formula": props.get("MolecularFormula"),
-            "massa": props.get("MolecularWeight"),
-            "iupac": props.get("IUPACName"),
-        }
-
-    except:
-        return None
+    print("   ❌ Falhou após tentativas")
+    return None
 
 
 # =========================
-# CHEBI (taxonomia simples)
-# =========================
-def buscar_chebi(nome_composto):
-    try:
-        url = f"https://www.ebi.ac.uk/chebi/searchId.do?chebiId={nome_composto}"
-        response = requests.get(url, timeout=10)
-
-        if response.status_code != 200:
-            return None
-
-        # Simples (placeholder — API real é mais complexa SOAP/REST)
-        return {
-            "chebi_id": None,
-            "tipo": None  # Aqui entraria classe química
-        }
-
-    except:
-        return None
-
-
-# =========================
-# LIMPEZA DE DADOS
-# =========================
-def normalizar_nome(nome):
-    if pd.isna(nome):
-        return None
-    return str(nome).strip().lower()
-
-
-# =========================
-# MAIN
+# FUNÇÃO PRINCIPAL
 # =========================
 def main():
     print("📂 Lendo arquivo...")
     df = pd.read_excel(ARQUIVO_ENTRADA)
 
+    print("📊 Colunas encontradas:")
+    print(df.columns)
+
+    # TESTE RÁPIDO (remova depois)
+    # df = df.head(10)
+
     resultados = []
 
-    for _, row in df.iterrows():
-        nome = normalizar_nome(row.get("Compound"))
+    for index, row in df.iterrows():
+        massa = row.get("Neutral mass (Da)")
+        tempo_retencao = row.get("Retention time (min)")
+        sinal_bruto = row.get("Compound")
 
-        if not nome:
+        print(f"\n[{index}] 🔎 Sinal: {sinal_bruto}")
+        print(f"   ⚖️ Massa: {massa}")
+
+        if pd.isna(massa):
+            print("   ⚠️ Massa inválida, pulando...")
             continue
 
-        print(f"🔎 Buscando: {nome}")
-
-        pubchem = buscar_pubchem(nome)
-        chebi = buscar_chebi(nome)
+        dados_api = buscar_pubchem_por_massa(massa)
 
         resultados.append({
-            "composto": nome,
+            # SINAL BRUTO
+            "sinal_bruto": sinal_bruto,
+
+            # DADOS EXPERIMENTAIS
+            "massa_planilha": massa,
+            "tempo_retencao": tempo_retencao,
 
             # PUBCHEM
-            "cid_pubchem": pubchem["cid"] if pubchem else None,
-            "formula_pubchem": pubchem["formula"] if pubchem else None,
-            "massa_pubchem": pubchem["massa"] if pubchem else None,
-            "iupac_name": pubchem["iupac"] if pubchem else None,
-
-            # CHEBI (futuro)
-            "chebi_id": chebi["chebi_id"] if chebi else None,
-            "classe_quimica": chebi["tipo"] if chebi else None,
-
-            # PLANILHA
-            "massa_planilha": row.get("Neutral mass (Da)"),
-            "tempo_retencao": row.get("Retention time (min)")
+            "cid_pubchem": dados_api["cid"] if dados_api else None,
+            "formula_pubchem": dados_api["formula"] if dados_api else None,
+            "massa_pubchem": dados_api["massa"] if dados_api else None,
+            "iupac_name": dados_api["iupac"] if dados_api else None,
         })
 
+        # evitar bloqueio da API
         time.sleep(0.2)
 
+    print("\n💾 Gerando arquivo final...")
     df_resultado = pd.DataFrame(resultados)
-
-    print("💾 Salvando arquivo...")
     df_resultado.to_excel(ARQUIVO_SAIDA, index=False)
 
-    print("✅ Finalizado!")
+    print(f"✅ Arquivo gerado: {ARQUIVO_SAIDA}")
 
 
+# =========================
+# EXECUÇÃO
+# =========================
 if __name__ == "__main__":
     main()
