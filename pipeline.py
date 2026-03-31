@@ -103,7 +103,7 @@ def get_metadata(descricao):
 
 
 # =========================
-# 1. MERGE
+# 1. MERGE (CORRIGIDO)
 # =========================
 print("\n📂 Lendo arquivos...")
 df_id = pd.read_excel(ARQ_ID)
@@ -115,12 +115,8 @@ df_ab.columns = df_ab.columns.str.strip()
 df_id = df_id.drop_duplicates(subset=['Compound'])
 df_ab = df_ab.drop_duplicates(subset=['Compound'])
 
-df_ab = df_ab.merge(
-    df_id[['Compound', 'Compound ID']],
-    on='Compound',
-    how='left'
-)
-
+# Foi removido o merge do df_ab consigo mesmo que causava o erro.
+# Agora fazemos direto o inner join unindo a identificação com a abundância.
 df_merged = pd.merge(
     df_id,
     df_ab,
