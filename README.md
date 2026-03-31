@@ -2,13 +2,13 @@
 Atividade de Projeto Aplicado, desenvolvido pelo grupo My Chemical Data.
 
 ## Como Iniciar o Projeto:
-. Baixe ou Clone o Repositório
-. No terminal use o comando: pip install pandas requests openpyxl
-. Inicie o projeto com o comando python: python enriquecer_pubchem.py
+. Baixe ou Clone o Repositório <br />
+. No terminal use o comando: pip install pandas requests openpyxl <br />
+. Inicie o projeto com o comando python: python enriquecer_pubchem.py <br />
 
 ## Créditos:
-Matheus Cruz,
-Nicolas Mello,
+Matheus Cruz,<br />
+Nicolas Mello,<br />
 João Paulo
 
 ## Projeto CDIA — Aula 4
