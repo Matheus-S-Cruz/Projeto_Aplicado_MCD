@@ -2,6 +2,8 @@ import pandas as pd
 import requests
 import time
 import numpy as np
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =========================
 # CONFIG
@@ -10,113 +12,186 @@ ARQ_ID = 'dados_brutos/IDENTIFICACAO.xlsx'
 ARQ_AB = 'dados_brutos/ABUND.xlsx'
 ARQ_FINAL = 'dados_brutos/compostos_final.xlsx'
 
+ARQ_CACHE = 'cache_pubchem.json'
+
+MAX_WORKERS = 3
+DELAY = 0.05
+TIMEOUT = 5
+SALVAR_CACHE_CADA = 50
+
 # =========================
-# CACHE GLOBAL
+# SESSION HTTP
 # =========================
-cache_api = {}
+session = requests.Session()
+
+# =========================
+# CACHE
+# =========================
+try:
+    with open(ARQ_CACHE, 'r', encoding='utf-8') as f:
+        cache_api = json.load(f)
+
+    print(f"✅ Cache carregado: {len(cache_api)} itens")
+
+except:
+    cache_api = {}
+    print("⚠️ Novo cache criado")
 
 # =========================
 # NORMALIZAÇÃO
 # =========================
 def normalizar_nome(nome):
+
     if pd.isna(nome):
         return None
 
     nome = str(nome)
+
     nome = nome.split("[")[0]
     nome = nome.strip()
 
+    # remove nomes absurdamente grandes
+    if len(nome) > 120:
+        return None
+
+    # remove compostos ruins
+    blacklist = [
+        "unknown",
+        "unidentified",
+        "untitled"
+    ]
+
+    if nome.lower() in blacklist:
+        return None
+
     return nome
+
+# =========================
+# CACHE SAVE
+# =========================
+def salvar_cache():
+
+    with open(ARQ_CACHE, 'w', encoding='utf-8') as f:
+        json.dump(cache_api, f, ensure_ascii=False, indent=4)
 
 # =========================
 # PUBCHEM
 # =========================
 def buscar_pubchem(nome):
-    url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{nome}/property/MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
 
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            return {}
+    url = (
+        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+        f"{nome}/property/"
+        f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+    )
 
-        props = r.json()["PropertyTable"]["Properties"][0]
+    for tentativa in range(2):
 
-        return {
-            "pubchem_cid": props.get("CID"),
-            "formula": props.get("MolecularFormula"),
-            "massa_api": props.get("MolecularWeight"),
-            "iupac": props.get("IUPACName")
-        }
+        try:
 
-    except:
-        return {}
+            r = session.get(
+                url,
+                timeout=TIMEOUT
+            )
 
-# =========================
-# ChEBI (REST real simplificado)
-# =========================
-def buscar_chebi(nome):
-    try:
-        url = f"https://www.ebi.ac.uk/chebi/ws/rest/search?searchTerm={nome}&stars=3"
-        r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                return {}
 
-        if r.status_code != 200:
-            return {}
+            data = r.json()
 
-        data = r.json()
+            props = (
+                data
+                .get("PropertyTable", {})
+                .get("Properties", [])
+            )
 
-        if "listElement" not in data:
-            return {}
+            if not props:
+                return {}
 
-        primeiro = data["listElement"][0]
+            props = props[0]
 
-        return {
-            "chebi_id": primeiro.get("chebiId"),
-            "chebi_name": primeiro.get("chebiAsciiName"),
-            "score_chebi": primeiro.get("searchScore")
-        }
+            return {
+                "pubchem_cid": props.get("CID"),
+                "formula": props.get("MolecularFormula"),
+                "massa_api": props.get("MolecularWeight"),
+                "iupac": props.get("IUPACName")
+            }
 
-    except:
-        return {}
+        except Exception:
+            time.sleep(0.5)
+
+    return {}
 
 # =========================
-# METADATA COMPLETO
+# METADATA
 # =========================
 def get_metadata(descricao):
+
     if descricao in cache_api:
         return cache_api[descricao]
 
     nome = normalizar_nome(descricao)
 
     if not nome:
+        cache_api[descricao] = {}
         return {}
 
-    pubchem = buscar_pubchem(nome)
-    chebi = buscar_chebi(nome)
-
-    resultado = {
-        **pubchem,
-        **chebi
-    }
+    resultado = buscar_pubchem(nome)
 
     cache_api[descricao] = resultado
+
     return resultado
 
+# =========================
+# THREAD
+# =========================
+def enriquecer_descricao(desc):
+
+    print(f"🔎 {desc[:80]}")
+
+    meta = get_metadata(desc)
+
+    time.sleep(DELAY)
+
+    return {
+        "Description": desc,
+        **meta
+    }
 
 # =========================
-# 1. MERGE (CORRIGIDO)
+# LEITURA
 # =========================
 print("\n📂 Lendo arquivos...")
+
 df_id = pd.read_excel(ARQ_ID)
 df_ab = pd.read_excel(ARQ_AB)
 
 df_id.columns = df_id.columns.str.strip()
 df_ab.columns = df_ab.columns.str.strip()
 
+# =========================
+# GARANTE COMPOUND ID
+# =========================
+if 'Compound ID' not in df_id.columns:
+
+    if 'Compound' in df_id.columns:
+        df_id['Compound ID'] = df_id['Compound']
+
+# =========================
+# LIMPEZA
+# =========================
+print("\n🧹 Limpando dados...")
+
 df_id = df_id.drop_duplicates(subset=['Compound'])
 df_ab = df_ab.drop_duplicates(subset=['Compound'])
 
-# Foi removido o merge do df_ab consigo mesmo que causava o erro.
-# Agora fazemos direto o inner join unindo a identificação com a abundância.
+df_id = df_id.dropna(subset=['Description'])
+
+# =========================
+# MERGE
+# =========================
+print("\n🔗 Realizando merge...")
+
 df_merged = pd.merge(
     df_id,
     df_ab,
@@ -127,58 +202,176 @@ df_merged = pd.merge(
 print(f"✅ Merge OK: {df_merged.shape[0]} linhas")
 
 # =========================
-# 2. ENRIQUECIMENTO
+# DESCRIPTIONS
+# =========================
+descricoes = (
+    df_merged['Description']
+    .dropna()
+    .astype(str)
+    .unique()
+)
+
+print(f"🧪 Descriptions únicas: {len(descricoes)}")
+
+# =========================
+# ENRIQUECIMENTO
 # =========================
 print("\n🌐 Enriquecendo dados...")
 
-descricoes = df_merged['Description'].dropna().unique()
-
 metadados = []
 
-for i, desc in enumerate(descricoes):
-    print(f"[{i}] 🔎 {desc}")
+contador = 0
 
-    meta = get_metadata(desc)
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
 
-    metadados.append({
-        "Description": desc,
-        **meta
-    })
+    futures = {
+        executor.submit(
+            enriquecer_descricao,
+            desc
+        ): desc
 
-    time.sleep(0.2)
+        for desc in descricoes
+    }
 
+    for future in as_completed(futures):
+
+        try:
+
+            resultado = future.result()
+
+            metadados.append(resultado)
+
+            contador += 1
+
+            if contador % SALVAR_CACHE_CADA == 0:
+
+                salvar_cache()
+
+                print(f"💾 Cache parcial salvo ({contador})")
+
+        except Exception as e:
+            print(f"⚠️ Erro paralelo: {e}")
+
+# salva final
+salvar_cache()
+
+print("💾 Cache final salvo")
+
+# =========================
+# METADATA DF
+# =========================
 df_meta = pd.DataFrame(metadados)
 
-df_enriquecido = pd.merge(df_merged, df_meta, on="Description", how="left")
+df_enriquecido = pd.merge(
+    df_merged,
+    df_meta,
+    on='Description',
+    how='left'
+)
 
 print("✅ Enriquecimento concluído")
 
 # =========================
-# 3. RANKING
+# REPLICATAS
 # =========================
-print("\n📊 Calculando ranking...")
+print("\n📊 Detectando replicatas...")
 
-replicatas = [col for col in df_enriquecido.columns if "." in col]
+replicatas = []
 
-df_enriquecido[replicatas] = df_enriquecido[replicatas].apply(pd.to_numeric, errors='coerce')
-df_enriquecido['Score'] = pd.to_numeric(df_enriquecido['Score'], errors='coerce')
+for col in df_enriquecido.columns:
 
-df_enriquecido['media'] = df_enriquecido[replicatas].mean(axis=1)
-df_enriquecido['std'] = df_enriquecido[replicatas].std(axis=1)
+    nome = str(col).lower()
 
-df_enriquecido['cv'] = df_enriquecido['std'] / df_enriquecido['media'].replace(0, 1)
+    if (
+        "sample" in nome or
+        "rep" in nome or
+        "abund" in nome
+    ):
+        replicatas.append(col)
 
-df_enriquecido['confianca'] = (
-    (1 / (1 + df_enriquecido['cv'])) *
-    df_enriquecido['Score'] *
-    np.log(df_enriquecido['media'] + 1)
+print(f"✅ Replicatas encontradas: {len(replicatas)}")
+
+# fallback
+if len(replicatas) == 0:
+
+    numericas = df_enriquecido.select_dtypes(
+        include=[np.number]
+    ).columns.tolist()
+
+    remover = [
+        'Score',
+        'pubchem_cid',
+        'massa_api'
+    ]
+
+    replicatas = [
+        c for c in numericas
+        if c not in remover
+    ]
+
+    print(f"✅ Fallback replicatas: {len(replicatas)}")
+
+# =========================
+# NUMÉRICO
+# =========================
+df_enriquecido[replicatas] = (
+    df_enriquecido[replicatas]
+    .apply(pd.to_numeric, errors='coerce')
 )
+
+df_enriquecido['Score'] = pd.to_numeric(
+    df_enriquecido['Score'],
+    errors='coerce'
+)
+
+# =========================
+# ESTATÍSTICAS
+# =========================
+print("\n📈 Calculando estatísticas...")
+
+df_enriquecido['media'] = (
+    df_enriquecido[replicatas]
+    .mean(axis=1)
+)
+
+df_enriquecido['std'] = (
+    df_enriquecido[replicatas]
+    .std(axis=1)
+)
+
+df_enriquecido['cv'] = (
+    df_enriquecido['std'] /
+    df_enriquecido['media']
+)
+
+df_enriquecido['cv'] = (
+    df_enriquecido['cv']
+    .replace([np.inf, -np.inf], np.nan)
+)
+
+# =========================
+# SCORE FINAL
+# =========================
+df_enriquecido['confianca'] = (
+    (
+        1 / (1 + df_enriquecido['cv'].fillna(1))
+    ) *
+    df_enriquecido['Score'].fillna(1) *
+    np.log1p(
+        df_enriquecido['media'].fillna(1)
+    )
+)
+
+# =========================
+# RANKING
+# =========================
+print("\n🏆 Gerando ranking...")
 
 ranking = (
     df_enriquecido
-    .dropna(subset=['confianca'])
-    .groupby('Compound ID')['confianca']
+    .groupby('Description')['confianca']
     .mean()
+    .dropna()
     .sort_values(ascending=False)
 )
 
@@ -186,33 +379,58 @@ print("\n🏆 TOP 10:")
 print(ranking.head(10))
 
 # =========================
-# 4. VALIDAÇÃO
+# VALIDAÇÃO
 # =========================
-print("\n🔍 Validando com compostos_final...")
+print("\n🔍 Validando...")
 
 try:
+
     df_ref = pd.read_excel(ARQ_FINAL)
 
-    df_ref.columns = df_ref.columns.str.strip()
-
-    df_validacao = pd.merge(
-        df_enriquecido,
-        df_ref[['Compound ID']],
-        on='Compound ID',
-        how='inner'
+    df_ref.columns = (
+        df_ref.columns.str.strip()
     )
 
-    taxa = len(df_validacao) / len(df_enriquecido) * 100
+    if 'Compound ID' in df_ref.columns:
 
-    print(f"✅ Taxa de correspondência: {taxa:.2f}%")
+        df_validacao = pd.merge(
+            df_enriquecido,
+            df_ref[['Compound ID']],
+            on='Compound ID',
+            how='inner'
+        )
+
+        taxa = (
+            len(df_validacao)
+            / max(len(df_enriquecido), 1)
+        ) * 100
+
+        print(
+            f"✅ Taxa de correspondência: "
+            f"{taxa:.2f}%"
+        )
+
+    else:
+        print(
+            "⚠️ 'Compound ID' não encontrado"
+        )
 
 except Exception as e:
-    print("⚠️ Não foi possível validar:", e)
+    print(f"⚠️ Erro validação: {e}")
 
 # =========================
-# 5. EXPORT
+# EXPORT
 # =========================
-df_enriquecido.to_csv("pipeline_final.csv", index=False)
-ranking.to_csv("ranking.csv")
+print("\n💾 Exportando arquivos...")
 
-print("\n🎯 PIPELINE FINALIZADO COM SUCESSO!")
+df_enriquecido.to_csv(
+    "pipeline_final.csv",
+    index=False
+)
+
+ranking.to_csv(
+    "ranking.csv",
+    header=True
+)
+
+print("\n🎯 PIPELINE FINALIZADO!")

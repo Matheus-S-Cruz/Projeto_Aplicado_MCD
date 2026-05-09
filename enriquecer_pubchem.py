@@ -5,6 +5,12 @@ import time
 ARQUIVO_ENTRADA = "dados_brutos/IDENTIFICACAO.xlsx"
 ARQUIVO_SAIDA = "compostos_enriquecidos.xlsx"
 
+# Quantidade máxima de linhas para leitura
+LIMITE_LINHAS = 500
+
+# Delay entre requisições
+DELAY = 0.05
+
 # =========================
 # NORMALIZAÇÃO
 # =========================
@@ -21,7 +27,11 @@ def normalizar_nome(nome):
 # =========================
 def buscar_pubchem(nome):
     try:
-        url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{nome}/property/MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+            f"{nome}/property/MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+        )
+
         r = requests.get(url, timeout=10)
 
         if r.status_code != 200:
@@ -36,7 +46,8 @@ def buscar_pubchem(nome):
             "iupac_name": props.get("IUPACName"),
         }
 
-    except:
+    except Exception as e:
+        print(f"Erro PubChem ({nome}): {e}")
         return {}
 
 # =========================
@@ -44,13 +55,22 @@ def buscar_pubchem(nome):
 # =========================
 def buscar_chebi(nome):
     try:
-        url = f"https://www.ebi.ac.uk/chebi/ws/rest/search?searchTerm={nome}&stars=3"
+        url = (
+            f"https://www.ebi.ac.uk/chebi/ws/rest/search"
+            f"?searchTerm={nome}&stars=3"
+        )
+
         r = requests.get(url, timeout=10)
 
         if r.status_code != 200:
             return {}
 
-        data = r.json()
+        # Algumas versões da API retornam XML.
+        # Este bloco tenta interpretar JSON apenas se disponível.
+        try:
+            data = r.json()
+        except:
+            return {}
 
         if "listElement" not in data:
             return {}
@@ -62,7 +82,8 @@ def buscar_chebi(nome):
             "chebi_nome": primeiro.get("chebiAsciiName"),
         }
 
-    except:
+    except Exception as e:
+        print(f"Erro ChEBI ({nome}): {e}")
         return {}
 
 # =========================
@@ -83,9 +104,24 @@ def get_metadata(nome):
 # MAIN
 # =========================
 def main():
-    df = pd.read_excel(ARQUIVO_ENTRADA)
+    print("📖 Lendo planilha...")
+
+    # Lê apenas a coluna necessária
+    df = pd.read_excel(
+        ARQUIVO_ENTRADA,
+        usecols=["Compound"],
+        nrows=LIMITE_LINHAS
+    )
+
+    # Remove compostos duplicados
+    df = df.drop_duplicates(subset=["Compound"])
+
+    print(f"✅ Compostos únicos encontrados: {len(df)}")
 
     resultados = []
+
+    # Cache para evitar consultas repetidas
+    cache = {}
 
     for i, row in df.iterrows():
         nome = row.get("Compound")
@@ -93,22 +129,35 @@ def main():
         if pd.isna(nome):
             continue
 
-        print(f"[{i}] 🔎 {nome}")
+        nome_limpo = normalizar_nome(nome)
 
-        meta = get_metadata(nome)
+        print(f"[{i}] 🔎 {nome_limpo}")
+
+        # Usa cache se já consultado
+        if nome_limpo in cache:
+            meta = cache[nome_limpo]
+            print("   ↳ usando cache")
+
+        else:
+            meta = get_metadata(nome_limpo)
+            cache[nome_limpo] = meta
 
         resultados.append({
             "sinal_bruto": nome,
-            "nome_normalizado": normalizar_nome(nome),
+            "nome_normalizado": nome_limpo,
             **meta
         })
 
-        time.sleep(0.2)
+        # Pequena pausa para evitar bloqueio da API
+        time.sleep(DELAY)
+
+    print("💾 Salvando resultados...")
 
     df_final = pd.DataFrame(resultados)
     df_final.to_excel(ARQUIVO_SAIDA, index=False)
 
     print("✅ Enriquecimento concluído!")
+    print(f"📄 Arquivo salvo em: {ARQUIVO_SAIDA}")
 
 if __name__ == "__main__":
     main()
