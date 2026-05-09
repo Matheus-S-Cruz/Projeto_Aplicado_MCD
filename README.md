@@ -3,7 +3,7 @@ Atividade de Projeto Aplicado, desenvolvido pelo grupo My Chemical Data.
 
 ## Como Iniciar o Projeto:
 - Baixe ou Clone o Repositório <br />
-- No terminal use o comando: pip install pandas requests openpyxl <br />
+- No terminal use o comando: pip install pandas requests openpyxl scikit-learn <br />
 - Inicie o projeto com o comando python: python enriquecer_pubchem.py <br />
 - Utilize também o comando: python pipeline.py
 
