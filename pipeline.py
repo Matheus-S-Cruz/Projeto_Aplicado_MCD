@@ -3,7 +3,11 @@ import requests
 import time
 import numpy as np
 import json
+import re
+
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.preprocessing import MinMaxScaler
 
 # =========================
 # CONFIG
@@ -50,15 +54,23 @@ def normalizar_nome(nome):
     nome = nome.split("[")[0]
     nome = nome.strip()
 
-    # remove nomes absurdamente grandes
-    if len(nome) > 120:
+    # remove caracteres problemáticos
+    nome = re.sub(r'[^a-zA-Z0-9\s\-\(\),]', '', nome)
+
+    # remove espaços duplos
+    nome = re.sub(r'\s+', ' ', nome)
+
+    # remove nomes absurdos
+    if len(nome) > 80:
         return None
 
-    # remove compostos ruins
+    # blacklist
     blacklist = [
         "unknown",
         "unidentified",
-        "untitled"
+        "untitled",
+        "na",
+        "null"
     ]
 
     if nome.lower() in blacklist:
@@ -79,46 +91,58 @@ def salvar_cache():
 # =========================
 def buscar_pubchem(nome):
 
-    url = (
-        f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-        f"{nome}/property/"
-        f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
-    )
+    if not nome:
+        return {}
 
-    for tentativa in range(2):
+    estrategias = [
+        nome,
+        nome.split(",")[0],
+        " ".join(nome.split()[:4]),
+        quote(nome.replace("-", " "))
+    ]
 
-        try:
+    for tentativa_nome in estrategias:
 
-            r = session.get(
-                url,
-                timeout=TIMEOUT
-            )
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+            f"{tentativa_nome}/property/"
+            f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+        )
 
-            if r.status_code != 200:
-                return {}
+        for tentativa in range(2):
 
-            data = r.json()
+            try:
 
-            props = (
-                data
-                .get("PropertyTable", {})
-                .get("Properties", [])
-            )
+                r = session.get(
+                    url,
+                    timeout=TIMEOUT
+                )
 
-            if not props:
-                return {}
+                if r.status_code != 200:
+                    continue
 
-            props = props[0]
+                data = r.json()
 
-            return {
-                "pubchem_cid": props.get("CID"),
-                "formula": props.get("MolecularFormula"),
-                "massa_api": props.get("MolecularWeight"),
-                "iupac": props.get("IUPACName")
-            }
+                props = (
+                    data
+                    .get("PropertyTable", {})
+                    .get("Properties", [])
+                )
 
-        except Exception:
-            time.sleep(0.5)
+                if not props:
+                    continue
+
+                props = props[0]
+
+                return {
+                    "pubchem_cid": props.get("CID"),
+                    "formula": props.get("MolecularFormula"),
+                    "massa_api": props.get("MolecularWeight"),
+                    "iupac": props.get("IUPACName")
+                }
+
+            except Exception:
+                time.sleep(0.5)
 
     return {}
 
@@ -257,10 +281,25 @@ salvar_cache()
 
 print("💾 Cache final salvo")
 
+
 # =========================
 # METADATA DF
 # =========================
 df_meta = pd.DataFrame(metadados)
+
+# garante colunas mesmo vazias
+colunas_metadata = [
+    'Description',
+    'pubchem_cid',
+    'formula',
+    'massa_api',
+    'iupac'
+]
+
+for col in colunas_metadata:
+
+    if col not in df_meta.columns:
+        df_meta[col] = np.nan
 
 df_enriquecido = pd.merge(
     df_merged,
@@ -339,9 +378,10 @@ df_enriquecido['std'] = (
     .std(axis=1)
 )
 
-df_enriquecido['cv'] = (
-    df_enriquecido['std'] /
-    df_enriquecido['media']
+df_enriquecido['cv'] = np.where(
+    df_enriquecido['media'] > 0,
+    df_enriquecido['std'] / df_enriquecido['media'],
+    np.nan
 )
 
 df_enriquecido['cv'] = (
@@ -350,16 +390,83 @@ df_enriquecido['cv'] = (
 )
 
 # =========================
-# SCORE FINAL
+# NORMALIZAÇÃO SEGURA
 # =========================
+def normalizar_coluna(df, coluna):
+
+    valores = df[[coluna]].fillna(0)
+
+    if valores.nunique().iloc[0] <= 1:
+        return np.zeros(len(df))
+
+    scaler = MinMaxScaler()
+
+    return scaler.fit_transform(valores).flatten()
+
+# log para reduzir impacto de outliers
+df_enriquecido['media_log'] = np.log1p(
+    df_enriquecido['media']
+)
+
+df_enriquecido['media_norm'] = normalizar_coluna(
+    df_enriquecido,
+    'media_log'
+)
+
+df_enriquecido['score_norm'] = normalizar_coluna(
+    df_enriquecido,
+    'Score'
+)
+
+# =========================
+# SCORE CIENTÍFICO
+# =========================
+print("\n🧠 Calculando score científico...")
+
+scaler = MinMaxScaler()
+
+# metadata válida
+df_enriquecido['metadata_ok'] = np.where(
+    df_enriquecido['pubchem_cid'].notna(),
+    1,
+    0
+)
+
+# remove outliers extremos
+limite = df_enriquecido['media'].quantile(0.99)
+
+df_enriquecido = df_enriquecido[
+    df_enriquecido['media'] <= limite
+]
+
+df_enriquecido['score_norm'] = scaler.fit_transform(
+    df_enriquecido[['Score']].fillna(0)
+)
+
+cv_temp = df_enriquecido['cv'].fillna(
+    df_enriquecido['cv'].median()
+)
+
+df_enriquecido['cv_norm'] = scaler.fit_transform(
+    cv_temp.values.reshape(-1, 1)
+)
+
+# estabilidade
+df_enriquecido['estabilidade'] = (
+    1 - df_enriquecido['cv_norm']
+)
+
+# score final ponderado
 df_enriquecido['confianca'] = (
-    (
-        1 / (1 + df_enriquecido['cv'].fillna(1))
-    ) *
-    df_enriquecido['Score'].fillna(1) *
-    np.log1p(
-        df_enriquecido['media'].fillna(1)
-    )
+    0.40 * df_enriquecido['media_norm'] +
+    0.30 * df_enriquecido['score_norm'] +
+    0.20 * df_enriquecido['estabilidade'] +
+    0.10 * df_enriquecido['metadata_ok']
+)
+
+df_enriquecido['confianca'] = (
+    df_enriquecido['confianca']
+    .clip(lower=0)
 )
 
 # =========================
@@ -377,6 +484,27 @@ ranking = (
 
 print("\n🏆 TOP 10:")
 print(ranking.head(10))
+
+# =========================
+# RANKING DETALHADO
+# =========================
+ranking_detalhado = (
+    df_enriquecido[
+        [
+            'Description',
+            'confianca',
+            'media',
+            'cv',
+            'Score',
+            'pubchem_cid',
+            'formula'
+        ]
+    ]
+    .sort_values(
+        by='confianca',
+        ascending=False
+    )
+)
 
 # =========================
 # VALIDAÇÃO
@@ -431,6 +559,11 @@ df_enriquecido.to_csv(
 ranking.to_csv(
     "ranking.csv",
     header=True
+)
+
+ranking_detalhado.to_csv(
+    "ranking_detalhado.csv",
+    index=False
 )
 
 print("\n🎯 PIPELINE FINALIZADO!")
