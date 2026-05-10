@@ -4,6 +4,7 @@ import time
 import numpy as np
 import json
 import re
+import xml.etree.ElementTree as ET
 
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,14 +15,15 @@ from sklearn.preprocessing import MinMaxScaler
 # =========================
 ARQ_ID = 'dados_brutos/IDENTIFICACAO.xlsx'
 ARQ_AB = 'dados_brutos/ABUND.xlsx'
-ARQ_FINAL = 'dados_brutos/compostos_final.xlsx'
+ARQ_FINAL = 'dados_brutos/Compostos_final.xlsx'
 
 ARQ_CACHE = 'cache_pubchem.json'
 
 MAX_WORKERS = 3
 DELAY = 0.05
-TIMEOUT = 5
+TIMEOUT = 10
 SALVAR_CACHE_CADA = 50
+LIMITE_COMPOSTOS = None  # None = sem limite
 
 # =========================
 # SESSION HTTP
@@ -87,7 +89,7 @@ def salvar_cache():
         json.dump(cache_api, f, ensure_ascii=False, indent=4)
 
 # =========================
-# PUBCHEM
+# PUBCHEM - PROPRIEDADES
 # =========================
 def buscar_pubchem(nome):
 
@@ -106,7 +108,7 @@ def buscar_pubchem(nome):
         url = (
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
             f"{tentativa_nome}/property/"
-            f"MolecularFormula,MolecularWeight,IUPACName,CID/JSON"
+            f"MolecularFormula,MolecularWeight,IUPACName/JSON"
         )
 
         for tentativa in range(2):
@@ -147,7 +149,295 @@ def buscar_pubchem(nome):
     return {}
 
 # =========================
-# METADATA
+# PUBCHEM - DESCRIÇÃO/USOS
+# =========================
+def buscar_pubchem_descricao(cid):
+    """Busca descrição do composto no PubChem (usos e aplicações)."""
+
+    if not cid:
+        return {}
+
+    try:
+        url = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/"
+            f"{int(cid)}/description/JSON"
+        )
+
+        r = session.get(url, timeout=TIMEOUT)
+
+        if r.status_code != 200:
+            return {}
+
+        data = r.json()
+
+        informacoes = (
+            data
+            .get("InformationList", {})
+            .get("Information", [])
+        )
+
+        for info in informacoes:
+            desc = info.get("Description", "")
+            if desc and len(desc) > 20:
+                return {"uso_descricao": desc[:500]}
+
+        return {}
+
+    except Exception:
+        return {}
+
+# =========================
+# CHEBI (via PubChem proxy)
+# =========================
+def buscar_chebi_via_pubchem(cid):
+    """Busca ChEBI ID e ontologia usando PubChem como proxy."""
+
+    if not cid:
+        return {}
+
+    result = {}
+
+    try:
+        # 1. ChEBI ID via sinônimos
+        url_syn = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
+            f"compound/cid/{int(cid)}/synonyms/JSON"
+        )
+
+        r = session.get(url_syn, timeout=TIMEOUT)
+
+        if r.status_code == 200:
+            syns = (
+                r.json()
+                .get("InformationList", {})
+                .get("Information", [{}])[0]
+                .get("Synonym", [])
+            )
+
+            for s in syns:
+                if 'CHEBI:' in s.upper():
+                    result['chebi_id'] = s
+                    break
+
+        time.sleep(DELAY)
+
+        # 2. Ontologia via classificação ChEBI no PubChem
+        url_class = (
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
+            f"compound/cid/{int(cid)}/classification/JSON"
+        )
+
+        r2 = session.get(url_class, timeout=15)
+
+        if r2.status_code == 200:
+            data = r2.json()
+
+            hierarchies = (
+                data
+                .get("Hierarchies", {})
+                .get("Hierarchy", [])
+            )
+
+            for h in hierarchies:
+                src = h.get("SourceName", "")
+
+                if src != "ChEBI":
+                    continue
+
+                nodes = h.get("Node", [])
+
+                # extrai nome de cada nó
+                def get_node_name(n):
+                    info = n.get("Information", {})
+                    name_obj = info.get("Name", {})
+                    if isinstance(name_obj, dict):
+                        swm = name_obj.get(
+                            "StringWithMarkup", {}
+                        )
+                        return (
+                            swm.get("String", "")
+                            if isinstance(swm, dict)
+                            else ""
+                        )
+                    return str(name_obj)
+
+                # nome ChEBI (nó com Match=true)
+                match_node_id = None
+                for n in nodes:
+                    info = n.get("Information", {})
+                    if info.get("Match"):
+                        result['chebi_nome'] = get_node_name(n)
+                        match_node_id = n.get("NodeID")
+                        break
+
+                # pais diretos do nó match
+                # (os mais específicos primeiro)
+                if match_node_id:
+                    # monta mapa de nós
+                    node_map = {
+                        n.get("NodeID"): n
+                        for n in nodes
+                    }
+
+                    parent_names = []
+                    current = node_map.get(match_node_id)
+
+                    # sobe a hierarquia
+                    for _ in range(5):
+                        if not current:
+                            break
+                        parent_ids = current.get(
+                            "ParentID", []
+                        )
+                        if not parent_ids:
+                            break
+                        pid = (
+                            parent_ids[0]
+                            if isinstance(parent_ids, list)
+                            else parent_ids
+                        )
+                        parent_node = node_map.get(pid)
+                        if not parent_node:
+                            break
+                        pname = get_node_name(parent_node)
+                        if pname and pname not in [
+                            'chemical entity',
+                            'molecular entity'
+                        ]:
+                            parent_names.append(pname)
+                        current = parent_node
+
+                    if parent_names:
+                        result['ontologia'] = (
+                            ' | '.join(parent_names)
+                        )
+
+                break  # só precisa do ChEBI
+
+        return result
+
+    except Exception:
+        return {}
+
+# =========================
+# CLASSIFICAÇÃO
+# =========================
+AMINOACIDOS = [
+    'ala', 'arg', 'asn', 'asp', 'cys', 'gln', 'glu',
+    'gly', 'his', 'ile', 'leu', 'lys', 'met', 'phe',
+    'pro', 'ser', 'thr', 'trp', 'tyr', 'val'
+]
+
+PEPTIDE_NOMES = {
+    2: 'dipeptídeo', 3: 'tripeptídeo',
+    4: 'tetrapeptídeo', 5: 'pentapeptídeo',
+    6: 'hexapeptídeo'
+}
+
+REGRAS_ONTOLOGIA = [
+    (['fatty acid', 'lipid', 'acyl'],
+     'Ácido graxo / Lipídio', 'Lipídios', 'Natural'),
+    (['amino acid', 'amino-acid'],
+     'Aminoácido', 'Aminoácidos', 'Natural'),
+    (['carbohydrate', 'sugar', 'glycoside', 'monosaccharide'],
+     'Carboidrato / Glicosídeo', 'Carboidratos', 'Natural'),
+    (['terpene', 'terpenoid', 'isoprenoid', 'monoterpene', 'sesquiterpene', 'diterpene'],
+     'Terpenoide', 'Terpenos', 'Natural'),
+    (['alkaloid'],
+     'Alcaloide', 'Alcaloides', 'Natural'),
+    (['flavonoid', 'phenol', 'polyphenol', 'phenylpropanoid'],
+     'Flavonoide / Polifenol', 'Fenólicos', 'Natural'),
+    (['steroid', 'sterol'],
+     'Esteroide', 'Lipídios', 'Natural'),
+    (['nucleotide', 'nucleoside', 'purine', 'pyrimidine'],
+     'Nucleotídeo / Nucleosídeo', 'Nucleotídeos', 'Natural'),
+    (['vitamin'],
+     'Vitamina', 'Cofatores', 'Natural'),
+    (['organic acid', 'carboxylic acid'],
+     'Ácido orgânico', 'Metabolismo primário', 'Natural'),
+    (['drug', 'pharmaceutical', 'xenobiotic'],
+     'Fármaco / Xenobiótico', 'Xenobiótico', 'Sintético'),
+]
+
+
+def classificar_composto(nome, pubchem_data, chebi_data):
+    """Classifica: natural/sintético, categoria química, metabolismo."""
+
+    nome_lower = (nome or "").lower()
+    ontologia = chebi_data.get('ontologia', '').lower()
+
+    # detecta peptídeos pelo nome
+    partes = nome_lower.replace("-", " ").split()
+    n_amino = sum(1 for p in partes if p in AMINOACIDOS)
+
+    if n_amino >= 2:
+        label = PEPTIDE_NOMES.get(
+            n_amino, f'peptídeo ({n_amino} aa)'
+        )
+        return {
+            'categoria_quimica': f'Peptídeo ({label})',
+            'metabolismo': 'Aminoácidos',
+            'tipo_composto': 'Natural'
+        }
+
+    # busca nas regras de ontologia
+    for palavras, cat, met, tipo in REGRAS_ONTOLOGIA:
+        if any(w in ontologia for w in palavras):
+            return {
+                'categoria_quimica': cat,
+                'metabolismo': met,
+                'tipo_composto': tipo
+            }
+
+    # fallback: nome contém "acid"
+    if any(w in nome_lower for w in ['acid', 'ácido']):
+        return {
+            'categoria_quimica': 'Ácido orgânico',
+            'metabolismo': 'Metabolismo primário',
+            'tipo_composto': 'Natural'
+        }
+
+    # fallback: usa primeiro parent da ontologia
+    if ontologia:
+        first_parent = chebi_data.get(
+            'ontologia', ''
+        ).split(' | ')[0]
+        return {
+            'categoria_quimica': first_parent,
+            'metabolismo': 'Metabolismo secundário',
+            'tipo_composto': 'Natural'
+        }
+
+    return {
+        'categoria_quimica': 'Não classificado',
+        'metabolismo': 'Indeterminado',
+        'tipo_composto': 'Indeterminado'
+    }
+
+# =========================
+# MODO DE IONIZAÇÃO
+# =========================
+def inferir_ionizacao(adducts):
+    """Infere modo de ionização a partir dos adutos."""
+
+    if pd.isna(adducts):
+        return "Indeterminado"
+
+    adducts_str = str(adducts).lower()
+
+    positivos = ['+h', '+na', '+k', '+nh4']
+    negativos = ['-h', '+cl', '+fa', '+hac', '+cho2']
+
+    if any(a in adducts_str for a in positivos):
+        return "Positivo"
+
+    if any(a in adducts_str for a in negativos):
+        return "Negativo"
+
+    return "Indeterminado"
+
+# =========================
+# METADATA COMPLETA
 # =========================
 def get_metadata(descricao):
 
@@ -160,7 +450,30 @@ def get_metadata(descricao):
         cache_api[descricao] = {}
         return {}
 
-    resultado = buscar_pubchem(nome)
+    # PubChem propriedades
+    resultado_pubchem = buscar_pubchem(nome)
+
+    # PubChem descrição/usos
+    resultado_descricao = buscar_pubchem_descricao(
+        resultado_pubchem.get('pubchem_cid')
+    )
+
+    # ChEBI (via PubChem synonyms + classification)
+    resultado_chebi = buscar_chebi_via_pubchem(
+        resultado_pubchem.get('pubchem_cid')
+    )
+
+    # classificação
+    classificacao = classificar_composto(
+        nome, resultado_pubchem, resultado_chebi
+    )
+
+    resultado = {
+        **resultado_pubchem,
+        **resultado_descricao,
+        **resultado_chebi,
+        **classificacao
+    }
 
     cache_api[descricao] = resultado
 
@@ -235,12 +548,15 @@ descricoes = (
     .unique()
 )
 
+if LIMITE_COMPOSTOS:
+    descricoes = descricoes[:LIMITE_COMPOSTOS]
+
 print(f"🧪 Descriptions únicas: {len(descricoes)}")
 
 # =========================
 # ENRIQUECIMENTO
 # =========================
-print("\n🌐 Enriquecendo dados...")
+print("\n🌐 Enriquecendo dados (PubChem + ChEBI)...")
 
 metadados = []
 
@@ -293,7 +609,15 @@ colunas_metadata = [
     'pubchem_cid',
     'formula',
     'massa_api',
-    'iupac'
+    'iupac',
+    'uso_descricao',
+    'chebi_id',
+    'chebi_nome',
+    'ontologia',
+    'chebi_definicao',
+    'categoria_quimica',
+    'metabolismo',
+    'tipo_composto'
 ]
 
 for col in colunas_metadata:
@@ -309,6 +633,15 @@ df_enriquecido = pd.merge(
 )
 
 print("✅ Enriquecimento concluído")
+
+# =========================
+# MODO DE IONIZAÇÃO
+# =========================
+print("\n🔬 Inferindo modo de ionização...")
+
+df_enriquecido['modo_ionizacao'] = (
+    df_enriquecido['Adducts'].apply(inferir_ionizacao)
+)
 
 # =========================
 # REPLICATAS
@@ -340,7 +673,14 @@ if len(replicatas) == 0:
     remover = [
         'Score',
         'pubchem_cid',
-        'massa_api'
+        'massa_api',
+        'Fragmentation Score',
+        'Isotope Similarity',
+        'Mass Error (ppm)',
+        'Neutral mass (Da)',
+        'Retention time (min)',
+        'Chromatographic peak width (min)',
+        'Identifications'
     ]
 
     replicatas = [
@@ -358,10 +698,12 @@ df_enriquecido[replicatas] = (
     .apply(pd.to_numeric, errors='coerce')
 )
 
-df_enriquecido['Score'] = pd.to_numeric(
-    df_enriquecido['Score'],
-    errors='coerce'
-)
+for col in ['Score', 'Fragmentation Score', 'Isotope Similarity']:
+    if col in df_enriquecido.columns:
+        df_enriquecido[col] = pd.to_numeric(
+            df_enriquecido[col],
+            errors='coerce'
+        )
 
 # =========================
 # ESTATÍSTICAS
@@ -425,9 +767,10 @@ print("\n🧠 Calculando score científico...")
 
 scaler = MinMaxScaler()
 
-# metadata válida
+# metadata válida (PubChem + ChEBI)
 df_enriquecido['metadata_ok'] = np.where(
-    df_enriquecido['pubchem_cid'].notna(),
+    df_enriquecido['pubchem_cid'].notna()
+    | df_enriquecido['chebi_id'].notna(),
     1,
     0
 )
@@ -456,11 +799,31 @@ df_enriquecido['estabilidade'] = (
     1 - df_enriquecido['cv_norm']
 )
 
-# score final ponderado
+# Fragmentation Score normalizado
+if 'Fragmentation Score' in df_enriquecido.columns:
+    df_enriquecido['frag_norm'] = normalizar_coluna(
+        df_enriquecido,
+        'Fragmentation Score'
+    )
+else:
+    df_enriquecido['frag_norm'] = 0
+
+# Isotope Similarity normalizado
+if 'Isotope Similarity' in df_enriquecido.columns:
+    df_enriquecido['isotope_norm'] = normalizar_coluna(
+        df_enriquecido,
+        'Isotope Similarity'
+    )
+else:
+    df_enriquecido['isotope_norm'] = 0
+
+# score final ponderado (inclui Fragmentation e Isotope)
 df_enriquecido['confianca'] = (
-    0.40 * df_enriquecido['media_norm'] +
-    0.30 * df_enriquecido['score_norm'] +
-    0.20 * df_enriquecido['estabilidade'] +
+    0.25 * df_enriquecido['media_norm'] +
+    0.20 * df_enriquecido['score_norm'] +
+    0.15 * df_enriquecido['frag_norm'] +
+    0.15 * df_enriquecido['isotope_norm'] +
+    0.15 * df_enriquecido['estabilidade'] +
     0.10 * df_enriquecido['metadata_ok']
 )
 
@@ -496,8 +859,16 @@ ranking_detalhado = (
             'media',
             'cv',
             'Score',
+            'Fragmentation Score',
+            'Isotope Similarity',
             'pubchem_cid',
-            'formula'
+            'formula',
+            'chebi_id',
+            'ontologia',
+            'categoria_quimica',
+            'metabolismo',
+            'tipo_composto',
+            'uso_descricao'
         ]
     ]
     .sort_values(
@@ -505,6 +876,47 @@ ranking_detalhado = (
         ascending=False
     )
 )
+
+# =========================
+# COMPOSTOS_FINAL (FORMATO MODELO)
+# =========================
+print("\n📋 Gerando planilha no formato Compostos_final...")
+
+# agrupa por Description (um registro por composto)
+df_compostos = (
+    df_enriquecido
+    .sort_values('confianca', ascending=False)
+    .drop_duplicates(subset=['Description'])
+)
+
+# monta ID sequencial
+df_compostos = df_compostos.reset_index(drop=True)
+df_compostos['ID_seq'] = [
+    f"COMP_{str(i+1).zfill(4)}"
+    for i in range(len(df_compostos))
+]
+
+compostos_final = pd.DataFrame({
+    'ID': df_compostos['ID_seq'],
+    'Metabólito/Composto': df_compostos['Description'],
+    'Fórmula': df_compostos['formula'],
+    'Massa Molecular': df_compostos['massa_api'],
+    'IUPAC': df_compostos['iupac'],
+    'Modo de Ionização': df_compostos['modo_ionizacao'],
+    'Categoria química': df_compostos['categoria_quimica'],
+    'Tipo (Natural/Sintético)': df_compostos['tipo_composto'],
+    'Metabolismo': df_compostos['metabolismo'],
+    'Ontologia (ChEBI)': df_compostos['ontologia'],
+    'PubChem CID': df_compostos['pubchem_cid'],
+    'ChEBI ID': df_compostos['chebi_id'],
+    'Usos/Aplicações': df_compostos['uso_descricao'],
+    'Score Confiança': df_compostos['confianca'].round(4),
+    'Score Identificação': df_compostos['Score'],
+    'Fragmentation Score': df_compostos['Fragmentation Score'],
+    'Isotope Similarity': df_compostos['Isotope Similarity'],
+    'Média Abundância': df_compostos['media'].round(2),
+    'CV (%)': (df_compostos['cv'] * 100).round(2)
+})
 
 # =========================
 # VALIDAÇÃO
@@ -547,6 +959,29 @@ except Exception as e:
     print(f"⚠️ Erro validação: {e}")
 
 # =========================
+# ESTATÍSTICAS FINAIS
+# =========================
+total = len(compostos_final)
+com_pubchem = compostos_final['PubChem CID'].notna().sum()
+com_chebi = compostos_final['ChEBI ID'].notna().sum()
+com_classif = (
+    compostos_final['Categoria química'] != 'Não classificado'
+).sum()
+naturais = (
+    compostos_final['Tipo (Natural/Sintético)'] == 'Natural'
+).sum()
+sinteticos = (
+    compostos_final['Tipo (Natural/Sintético)'] == 'Sintético'
+).sum()
+
+print(f"\n📊 RESUMO:")
+print(f"   Total compostos únicos: {total}")
+print(f"   Com PubChem CID: {com_pubchem} ({100*com_pubchem/max(total,1):.1f}%)")
+print(f"   Com ChEBI ID: {com_chebi} ({100*com_chebi/max(total,1):.1f}%)")
+print(f"   Classificados: {com_classif} ({100*com_classif/max(total,1):.1f}%)")
+print(f"   Naturais: {naturais} | Sintéticos: {sinteticos}")
+
+# =========================
 # EXPORT
 # =========================
 print("\n💾 Exportando arquivos...")
@@ -566,4 +1001,14 @@ ranking_detalhado.to_csv(
     index=False
 )
 
+compostos_final.to_excel(
+    "compostos_final_resultado.xlsx",
+    index=False
+)
+
 print("\n🎯 PIPELINE FINALIZADO!")
+print("📄 Arquivos gerados:")
+print("   - pipeline_final.csv (dados completos)")
+print("   - ranking.csv (ranking resumido)")
+print("   - ranking_detalhado.csv (ranking com detalhes)")
+print("   - compostos_final_resultado.xlsx (formato modelo)")
