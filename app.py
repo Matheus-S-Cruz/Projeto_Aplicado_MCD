@@ -1,5 +1,5 @@
 """
-QuimioAnalytics — Web app local (Streamlit).
+QuimioAnalytics: Web app local (Streamlit).
 
 Fluxo: o usuário sobe as 2 planilhas do Progenesis (identificação + abundância)
 -> o sistema roda o ETL + enriquecimento (etl.py) -> grava no banco (models.py)
@@ -41,6 +41,24 @@ def tem_dados() -> bool:
 st.sidebar.title(":material/science: QuimioAnalytics")
 st.sidebar.caption("Análise e priorização de compostos químicos")
 
+# --- Histórico de análises (no topo) ---
+st.sidebar.header(":material/history: Histórico")
+analises = etl.listar_analises(Session)
+if analises:
+    nomes = [a["nome"] for a in analises]
+    # aplica a seleção pendente (análise recém-criada), antes de instanciar o widget
+    nova = st.session_state.pop("_nova_analise", None)
+    if nova in nomes:
+        st.session_state["analise_sel"] = nova
+    if st.session_state.get("analise_sel") not in nomes:
+        st.session_state.pop("analise_sel", None)
+    escolha = st.sidebar.selectbox("Análise para visualizar", nomes, key="analise_sel")
+    analise_atual = next(a for a in analises if a["nome"] == escolha)
+    st.sidebar.caption(f"{len(analises)} análise(s) no histórico")
+else:
+    analise_atual = None
+
+st.sidebar.divider()
 st.sidebar.header(":material/upload_file: 1. Planilhas do Progenesis")
 arq_id = st.sidebar.file_uploader("Identificação (IDENTIFICACAO.xlsx)", type=["xlsx"])
 arq_ab = st.sidebar.file_uploader("Abundância (ABUND.xlsx)", type=["xlsx"])
@@ -49,7 +67,7 @@ usar_exemplo = st.sidebar.checkbox("Usar planilhas de exemplo (dados_brutos/)", 
 st.sidebar.header(":material/tune: 2. Modo de enriquecimento")
 modo = st.sidebar.radio(
     "Como buscar dados químicos?",
-    ["Cache (rápido — ideal p/ demo)", "APIs (completo — mais lento)"],
+    ["Cache (rápido e ideal p/ demo)", "APIs (completo e mais lento)"],
     help="O modo cache usa apenas o que já foi consultado antes (cache_pubchem.json).",
 )
 usar_cache = modo.startswith("Cache")
@@ -68,7 +86,7 @@ if st.sidebar.button("Processar", type="primary", width="stretch", icon=":materi
 
         try:
             resumo = etl.processar(id_src, ab_src, Session, usar_cache_apenas=usar_cache, progresso=_prog)
-            st.session_state["resumo"] = resumo
+            st.session_state["_nova_analise"] = resumo["analise_nome"]  # seleciona a nova no próximo ciclo
             barra.empty()
             st.sidebar.success(f"Processados {resumo['compostos']} compostos!")
             st.rerun()
@@ -79,28 +97,44 @@ if st.sidebar.button("Processar", type="primary", width="stretch", icon=":materi
 # =========================
 # CORPO
 # =========================
-st.title("QuimioAnalytics — Painel de Compostos")
+st.title("QuimioAnalytics: Painel de Compostos")
 
-if not tem_dados():
+if analise_atual is None:
     st.info("Envie as planilhas de identificação e abundância (ou marque *usar exemplo*) e clique em **Processar**.", icon=":material/arrow_back:")
     st.stop()
 
-df = etl.documento_ist(Session)
+try:
+    df = etl.carregar_analise(analise_atual["snapshot"])
+except Exception:
+    st.error("Não foi possível carregar o retrato desta análise (arquivo do histórico ausente).")
+    st.stop()
 
-if "resumo" in st.session_state:
-    r = st.session_state["resumo"]
-    st.caption(f"Último processamento: {r['compostos']} compostos · {r['medicoes']} medições · "
-               f"{r['amostras']} amostras · modo {r['modo']}.")
+st.caption(
+    f"Análise: **{analise_atual['nome']}** · {analise_atual['n_compostos']} compostos · "
+    f"{analise_atual['n_medicoes']} medições · {analise_atual['n_amostras']} amostras · modo {analise_atual['modo']}."
+)
 
-aba_tabela, aba_dash, aba_sobre = st.tabs([
-    ":material/table_view: Tabela (Documento IST)",
-    ":material/bar_chart: Dashboard",
-    ":material/info: Sobre",
-])
+col_tabs, col_del = st.columns([8, 1], vertical_alignment="top")
+
+with col_del:
+    with st.popover("Excluir", icon=":material/delete:"):
+        st.caption(f"Excluir a análise **{analise_atual['nome']}**? Esta ação não pode ser desfeita.")
+        if st.button("Confirmar exclusão", type="primary", icon=":material/delete_forever:"):
+            etl.excluir_analise(Session, analise_atual["id"], analise_atual["snapshot"])
+            st.session_state.pop("analise_sel", None)
+            st.toast("Análise excluída.")
+            st.rerun()
+
+with col_tabs:
+    aba_tabela, aba_dash, aba_sobre = st.tabs([
+        ":material/table_view: Tabela (Documento IST)",
+        ":material/bar_chart: Dashboard",
+        ":material/info: Sobre",
+    ])
 
 # ---------- TABELA ----------
 with aba_tabela:
-    st.subheader("Tabela final — formato Documento IST")
+    st.subheader("Tabela final (formato Documento IST)")
 
     c1, c2, c3 = st.columns([2, 2, 1])
     busca = c1.text_input(":material/search: Buscar (composto ou descrição)")

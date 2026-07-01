@@ -17,7 +17,9 @@ Ponto de entrada principal: processar(...).
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -32,6 +34,7 @@ import models
 # CONFIG
 # =========================
 ARQ_CACHE = "cache_pubchem.json"
+HIST_DIR = "historico"
 MAX_WORKERS = 3
 DELAY = 0.05
 TIMEOUT = 10
@@ -402,9 +405,8 @@ def processar(
     # 8) PERSISTÊNCIA
     _log("Gravando no banco...", 0.8)
     n = _persistir(df, reps, Session)
-    _log("Concluído.", 1.0)
 
-    return {
+    resumo = {
         "compostos": int(len(df)),
         "com_pubchem": int(df["pubchem_cid"].notna().sum()),
         "com_chebi": int(df["chebi_id"].notna().sum()),
@@ -412,6 +414,16 @@ def processar(
         "amostras": n["amostras"],
         "modo": "cache" if usar_cache_apenas else "API",
     }
+
+    # 9) HISTÓRICO — salva um retrato (snapshot) desta análise
+    _log("Registrando no histórico...", 0.95)
+    df_ist = documento_ist(Session)
+    ana = registrar_analise(Session, df_ist, resumo, arquivo_identificacao)
+    resumo["analise_id"] = ana["id"]
+    resumo["analise_nome"] = ana["nome"]
+
+    _log("Concluído.", 1.0)
+    return resumo
 
 
 def _persistir(df: pd.DataFrame, reps: list[str], Session) -> dict:
@@ -581,3 +593,86 @@ def documento_ist(Session) -> pd.DataFrame:
              "Abund. relativa", "Amostra mais abundante", "Descrição", "Classe geral",
              "Subclasse", "Confiança", "Posição"]
     return df[[c for c in ordem if c in df.columns]]
+
+
+# =========================
+# HISTÓRICO DE ANÁLISES (Opção B — snapshots)
+# =========================
+def _nome_arquivo(x) -> str:
+    """Extrai um nome legível de um caminho ou de um upload do Streamlit."""
+    if hasattr(x, "name"):
+        return os.path.basename(str(x.name))
+    return os.path.basename(str(x))
+
+
+def registrar_analise(Session, df_ist: pd.DataFrame, resumo: dict, arquivo_identificacao) -> dict:
+    """Salva o retrato (snapshot) da análise atual e registra na tabela `analise`."""
+    from models import Analise
+
+    os.makedirs(HIST_DIR, exist_ok=True)
+    agora = dt.datetime.now()
+    caminho = os.path.join(HIST_DIR, f"analise_{agora.strftime('%Y%m%d_%H%M%S')}.pkl")
+    df_ist.to_pickle(caminho)
+
+    nome = f"{agora.strftime('%d/%m/%Y %H:%M')} — {_nome_arquivo(arquivo_identificacao)}"
+    with Session() as s:
+        a = Analise(
+            nome=nome,
+            modo=resumo.get("modo"),
+            n_compostos=resumo.get("compostos"),
+            n_medicoes=resumo.get("medicoes"),
+            n_amostras=resumo.get("amostras"),
+            arquivo=_nome_arquivo(arquivo_identificacao),
+            snapshot=caminho,
+        )
+        s.add(a)
+        s.commit()
+        return {"id": a.id, "nome": a.nome}
+
+
+def listar_analises(Session) -> list[dict]:
+    """Lista as análises registradas, da mais recente para a mais antiga.
+
+    Auto-limpeza: registros cujo arquivo de snapshot não existe mais (ex.: apagado
+    manualmente da pasta `historico/`) são removidos do banco e não aparecem na lista.
+    """
+    from models import Analise
+
+    with Session() as s:
+        registros = s.query(Analise).order_by(Analise.criado_em.desc(), Analise.id.desc()).all()
+        validos, orfaos = [], []
+        for a in registros:
+            if a.snapshot and os.path.exists(a.snapshot):
+                validos.append({
+                    "id": a.id, "nome": a.nome, "modo": a.modo,
+                    "n_compostos": a.n_compostos, "n_medicoes": a.n_medicoes,
+                    "n_amostras": a.n_amostras, "snapshot": a.snapshot,
+                })
+            else:
+                orfaos.append(a)
+        for a in orfaos:  # remove registros sem arquivo (snapshot apagado na mão)
+            s.delete(a)
+        if orfaos:
+            s.commit()
+        return validos
+
+
+def carregar_analise(snapshot_path: str) -> pd.DataFrame:
+    """Carrega o retrato (Documento IST) de uma análise do histórico."""
+    return pd.read_pickle(snapshot_path)
+
+
+def excluir_analise(Session, analise_id: int, snapshot_path: str | None = None) -> None:
+    """Remove uma análise do histórico (registro no banco + arquivo do snapshot)."""
+    from models import Analise
+
+    with Session() as s:
+        a = s.get(Analise, analise_id)
+        if a is not None:
+            s.delete(a)
+            s.commit()
+    if snapshot_path and os.path.exists(snapshot_path):
+        try:
+            os.remove(snapshot_path)
+        except OSError:
+            pass

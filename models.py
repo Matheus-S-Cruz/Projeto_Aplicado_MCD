@@ -277,6 +277,25 @@ class ProcedenciaCampo(Base):
 
 
 # =========================================================
+# HISTÓRICO DE ANÁLISES (Opção B — snapshots)
+# Cada processamento vira um registro; o resultado (tabela Documento IST)
+# é salvo em arquivo (campo `snapshot`) para consulta posterior.
+# =========================================================
+class Analise(Base):
+    __tablename__ = "analise"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    nome: Mapped[str] = mapped_column(String(200))
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, server_default=func.now())
+    modo: Mapped[str | None] = mapped_column(String(20))                   # cache | API
+    n_compostos: Mapped[int | None]
+    n_medicoes: Mapped[int | None]
+    n_amostras: Mapped[int | None]
+    arquivo: Mapped[str | None] = mapped_column(String(255))               # nome do arquivo de identificação
+    snapshot: Mapped[str | None] = mapped_column(String(255))              # caminho do retrato salvo
+
+
+# =========================================================
 # TAGS FIXAS (seed) — conforme PDF de consolidação da reunião
 # =========================================================
 TAGS_PADRAO: list[tuple[str, str]] = [
