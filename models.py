@@ -53,7 +53,8 @@ class Composto(Base):
     __tablename__ = "composto"
 
     # --- Progenesis (interno) ---
-    compound_id: Mapped[str] = mapped_column(String(80), primary_key=True)  # ex.: 9.44_426.2758n
+    compound_id: Mapped[str] = mapped_column(String(80), primary_key=True)  # ex.: 9.44_426.2758n ("Compound")
+    compound_id_ext: Mapped[str | None] = mapped_column(String(80))         # "Compound ID" externo (CSID) -> coluna "Composto ID"
     nome: Mapped[str] = mapped_column(String(255), nullable=False)          # "Compound"
     description: Mapped[str | None] = mapped_column(Text)                   # chave de enriquecimento
 
