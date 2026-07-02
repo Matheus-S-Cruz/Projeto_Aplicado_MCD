@@ -29,10 +29,8 @@ def get_session():
 
 Session = get_session()
 
-
-def tem_dados() -> bool:
-    with Session() as s:
-        return s.query(models.Composto).first() is not None
+# enquanto processa, a UI fica TRAVADA (todos os widgets desabilitados) — evita interromper o job
+travado = bool(st.session_state.get("processando"))
 
 
 # =========================
@@ -52,60 +50,95 @@ if analises:
         st.session_state["analise_sel"] = nova
     if st.session_state.get("analise_sel") not in nomes:
         st.session_state.pop("analise_sel", None)
-    escolha = st.sidebar.selectbox("Análise para visualizar", nomes, key="analise_sel")
+    escolha = st.sidebar.selectbox("Análise para visualizar", nomes, key="analise_sel", disabled=travado)
     analise_atual = next(a for a in analises if a["nome"] == escolha)
     st.sidebar.caption(f"{len(analises)} análise(s) no histórico")
+    with st.sidebar.popover("Excluir análise", icon=":material/delete:", disabled=travado, width="stretch"):
+        st.caption(f"Excluir **{analise_atual['nome']}**? Esta ação não pode ser desfeita.")
+        if st.button("Confirmar exclusão", type="primary", icon=":material/delete_forever:"):
+            etl.excluir_analise(Session, analise_atual["id"], analise_atual["snapshot"])
+            st.session_state.pop("analise_sel", None)
+            st.toast("Análise excluída.")
+            st.rerun()
 else:
     analise_atual = None
 
 st.sidebar.divider()
 st.sidebar.header(":material/upload_file: 1. Planilhas do Progenesis")
-arq_id = st.sidebar.file_uploader("Identificação (IDENTIFICACAO.xlsx)", type=["xlsx"])
-arq_ab = st.sidebar.file_uploader("Abundância (ABUND.xlsx)", type=["xlsx"])
-usar_exemplo = st.sidebar.checkbox("Usar planilhas de exemplo (dados_brutos/)", value=False)
+arq_id = st.sidebar.file_uploader("Identificação (IDENTIFICACAO.xlsx)", type=["xlsx"], disabled=travado)
+arq_ab = st.sidebar.file_uploader("Abundância (ABUND.xlsx)", type=["xlsx"], disabled=travado)
+usar_exemplo = st.sidebar.checkbox("Usar planilhas de exemplo (dados_brutos/)", value=False, disabled=travado)
 
 st.sidebar.header(":material/tune: 2. Modo de enriquecimento")
 modo = st.sidebar.radio(
     "Como buscar dados químicos?",
     ["Cache (rápido e ideal p/ demo)", "APIs (completo e mais lento)"],
     help="O modo cache usa apenas o que já foi consultado antes (cache_pubchem.json).",
+    disabled=travado,
 )
 usar_cache = modo.startswith("Cache")
 
-if st.sidebar.button("Processar", type="primary", width="stretch", icon=":material/play_arrow:"):
-    id_src = "dados_brutos/IDENTIFICACAO.xlsx" if usar_exemplo else arq_id
-    ab_src = "dados_brutos/ABUND.xlsx" if usar_exemplo else arq_ab
-
-    if id_src is None or ab_src is None:
-        st.sidebar.error("Envie as duas planilhas (ou marque 'usar exemplo').")
+if st.sidebar.button("Processar", type="primary", width="stretch", icon=":material/play_arrow:", disabled=travado):
+    if usar_exemplo:
+        st.session_state["_src"] = {"modo": "exemplo", "cache": usar_cache}
+        st.session_state["processando"] = True
+        st.rerun()
+    elif arq_id is not None and arq_ab is not None:
+        st.session_state["_src"] = {
+            "modo": "upload", "cache": usar_cache,
+            "id_bytes": arq_id.getvalue(), "id_nome": arq_id.name,
+            "ab_bytes": arq_ab.getvalue(), "ab_nome": arq_ab.name,
+        }
+        st.session_state["processando"] = True
+        st.rerun()
     else:
-        barra = st.sidebar.progress(0.0, text="Iniciando...")
+        st.sidebar.error("Envie as duas planilhas (ou marque 'usar exemplo').")
 
-        def _prog(msg, frac):
-            barra.progress(min(frac or 0.0, 1.0), text=msg)
-
-        try:
-            resumo = etl.processar(id_src, ab_src, Session, usar_cache_apenas=usar_cache, progresso=_prog)
-            st.session_state["_nova_analise"] = resumo["analise_nome"]  # seleciona a nova no próximo ciclo
-            barra.empty()
-            st.sidebar.success(f"Processados {resumo['compostos']} compostos!", icon=":material/check_circle:")
-            st.rerun()
-        except etl.ErroValidacao as e:
-            barra.empty()
-            st.sidebar.warning(str(e), icon=":material/warning:")
-        except Exception as e:
-            barra.empty()
-            st.sidebar.error(
-                "Não foi possível processar as planilhas. Confira se enviou os arquivos corretos.",
-                icon=":material/error:",
-            )
-            with st.sidebar.expander("Detalhes técnicos"):
-                st.code(str(e))
+# feedback do processamento anterior
+if "_ok" in st.session_state:
+    st.sidebar.success(st.session_state.pop("_ok"), icon=":material/check_circle:")
+if "_erro" in st.session_state:
+    tipo, msg = st.session_state.pop("_erro")
+    if tipo == "warning":
+        st.sidebar.warning(msg, icon=":material/warning:")
+    else:
+        st.sidebar.error("Não foi possível processar as planilhas. Confira se enviou os arquivos corretos.",
+                         icon=":material/error:")
+        with st.sidebar.expander("Detalhes técnicos"):
+            st.code(msg)
 
 # =========================
 # CORPO
 # =========================
 st.title("MyChemicalData: Painel de Compostos")
+
+# Se estiver processando: mostra só a tela de progresso e roda o ETL.
+# (A sidebar já foi renderizada desabilitada acima, então nada é clicável.)
+if travado:
+    st.info("Processando a análise. **Não feche a aba nem recarregue a página** até concluir.",
+            icon=":material/hourglass_top:")
+    barra = st.progress(0.0, text="Iniciando...")
+
+    def _prog(msg, frac):
+        barra.progress(min(frac or 0.0, 1.0), text=msg)
+
+    src = st.session_state.get("_src", {})
+    try:
+        if src.get("modo") == "exemplo":
+            id_src, ab_src = "dados_brutos/IDENTIFICACAO.xlsx", "dados_brutos/ABUND.xlsx"
+        else:
+            id_src = io.BytesIO(src["id_bytes"]); id_src.name = src["id_nome"]
+            ab_src = io.BytesIO(src["ab_bytes"]); ab_src.name = src["ab_nome"]
+        resumo = etl.processar(id_src, ab_src, Session, usar_cache_apenas=src.get("cache", True), progresso=_prog)
+        st.session_state["_nova_analise"] = resumo["analise_nome"]
+        st.session_state["_ok"] = f"Processados {resumo['compostos']} compostos!"
+    except etl.ErroValidacao as e:
+        st.session_state["_erro"] = ("warning", str(e))
+    except Exception as e:
+        st.session_state["_erro"] = ("error", str(e))
+    st.session_state["processando"] = False
+    st.session_state.pop("_src", None)
+    st.rerun()
 
 if analise_atual is None:
     st.info("Envie as planilhas de identificação e abundância (ou marque *usar exemplo*) e clique em **Processar**.", icon=":material/arrow_back:")
@@ -122,33 +155,23 @@ st.caption(
     f"{analise_atual['n_medicoes']} medições · {analise_atual['n_amostras']} amostras · modo {analise_atual['modo']}."
 )
 
-col_tabs, col_del = st.columns([8, 1], vertical_alignment="top")
-
-with col_del:
-    with st.popover("Excluir", icon=":material/delete:"):
-        st.caption(f"Excluir a análise **{analise_atual['nome']}**? Esta ação não pode ser desfeita.")
-        if st.button("Confirmar exclusão", type="primary", icon=":material/delete_forever:"):
-            etl.excluir_analise(Session, analise_atual["id"], analise_atual["snapshot"])
-            st.session_state.pop("analise_sel", None)
-            st.toast("Análise excluída.")
-            st.rerun()
-
-with col_tabs:
-    aba_tabela, aba_dash, aba_sobre = st.tabs([
-        ":material/table_view: Tabela (Documento IST)",
-        ":material/bar_chart: Dashboard",
-        ":material/info: Sobre",
-    ])
+aba_tabela, aba_dash, aba_sobre = st.tabs([
+    ":material/table_view: Tabela (Documento IST)",
+    ":material/bar_chart: Dashboard",
+    ":material/info: Sobre",
+])
 
 # ---------- TABELA ----------
 with aba_tabela:
     st.subheader("Tabela final (formato Documento IST)")
 
-    c1, c2, c3 = st.columns([2, 2, 1])
+    c1, c2, c3, c4 = st.columns([2, 2, 1, 1])
     busca = c1.text_input(":material/search: Buscar (composto ou descrição)")
     classes = sorted([c for c in df["Classe geral"].dropna().unique()])
     filtro_classe = c2.multiselect("Filtrar por classe", classes)
     score_min = c3.number_input("Score mínimo", value=0.0, step=5.0)
+    tags_disp = sorted({t for s in df.get("Tags", pd.Series(dtype="object")).fillna("") for t in s.split(", ") if t})
+    filtro_tag = c4.multiselect("Filtrar por tag", tags_disp)
 
     dfx = df.copy()
     if busca:
@@ -161,6 +184,8 @@ with aba_tabela:
         dfx = dfx[dfx["Classe geral"].isin(filtro_classe)]
     if score_min:
         dfx = dfx[dfx["Score"].fillna(0) >= score_min]
+    if filtro_tag:
+        dfx = dfx[dfx["Tags"].fillna("").apply(lambda s: any(t in s.split(", ") for t in filtro_tag))]
 
     st.caption(f"{len(dfx)} de {len(df)} compostos")
     st.dataframe(dfx, width="stretch", hide_index=True)
@@ -199,11 +224,20 @@ with aba_dash:
 
     g3, g4 = st.columns(2)
 
-    # Modo de aquisição
-    modo_cont = df["Modo de aquisição"].fillna("Indeterminado").value_counts().reset_index()
-    modo_cont.columns = ["Modo", "qtd"]
-    fig_modo = px.bar(modo_cont, x="Modo", y="qtd", title="Modo de aquisição")
-    g3.plotly_chart(fig_modo, width="stretch")
+    # Compostos por tag
+    tags_series = df.get("Tags", pd.Series(index=df.index, dtype="object")).fillna("")
+    tags_exp = tags_series[tags_series != ""].str.split(", ").explode()
+    if not tags_exp.empty:
+        tag_cont = tags_exp.value_counts().reset_index()
+        tag_cont.columns = ["Tag", "qtd"]
+        ordem_tags = ["Abund > 500", "Abund > 1000", "Abund > 5000", "Abund > 10000",
+                      "Anova p-value <= 0.05", "Max Fold Change >= 2", "Not Fragmented", "Branco"]
+        tag_cont["_ord"] = tag_cont["Tag"].apply(lambda t: ordem_tags.index(t) if t in ordem_tags else 99)
+        tag_cont = tag_cont.sort_values("_ord")
+        fig_tag = px.bar(tag_cont, x="Tag", y="qtd", title="Compostos por tag")
+        g3.plotly_chart(fig_tag, width="stretch")
+    else:
+        g3.info("Sem tags nesta análise.")
 
     # Amostra mais abundante
     if "Amostra mais abundante" in df.columns:
