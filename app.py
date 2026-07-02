@@ -1,5 +1,5 @@
 """
-QuimioAnalytics: Web app local (Streamlit).
+MyChemicalData: Web app local (Streamlit).
 
 Fluxo: o usuário sobe as 2 planilhas do Progenesis (identificação + abundância)
 -> o sistema roda o ETL + enriquecimento (etl.py) -> grava no banco (models.py)
@@ -19,7 +19,7 @@ import streamlit as st
 import etl
 import models
 
-st.set_page_config(page_title="QuimioAnalytics", page_icon=":material/science:", layout="wide")
+st.set_page_config(page_title="MyChemicalData", page_icon=":material/science:", layout="wide")
 
 
 @st.cache_resource
@@ -38,7 +38,7 @@ def tem_dados() -> bool:
 # =========================
 # SIDEBAR — entrada e processamento
 # =========================
-st.sidebar.title(":material/science: QuimioAnalytics")
+st.sidebar.title(":material/science: MyChemicalData")
 st.sidebar.caption("Análise e priorização de compostos químicos")
 
 # --- Histórico de análises (no topo) ---
@@ -97,7 +97,7 @@ if st.sidebar.button("Processar", type="primary", width="stretch", icon=":materi
 # =========================
 # CORPO
 # =========================
-st.title("QuimioAnalytics: Painel de Compostos")
+st.title("MyChemicalData: Painel de Compostos")
 
 if analise_atual is None:
     st.info("Envie as planilhas de identificação e abundância (ou marque *usar exemplo*) e clique em **Processar**.", icon=":material/arrow_back:")
@@ -208,7 +208,7 @@ with aba_dash:
 with aba_sobre:
     st.markdown(
         """
-        ### O que é o QuimioAnalytics
+        ### O que é o MyChemicalData
         Sistema de apoio à decisão científica que processa dados de espectrometria de
         massas exportados do **Progenesis**, enriquece com bases públicas
         (**PubChem / ChEBI**), classifica os compostos e gera um **ranking de priorização**.
