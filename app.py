@@ -88,11 +88,19 @@ if st.sidebar.button("Processar", type="primary", width="stretch", icon=":materi
             resumo = etl.processar(id_src, ab_src, Session, usar_cache_apenas=usar_cache, progresso=_prog)
             st.session_state["_nova_analise"] = resumo["analise_nome"]  # seleciona a nova no próximo ciclo
             barra.empty()
-            st.sidebar.success(f"Processados {resumo['compostos']} compostos!")
+            st.sidebar.success(f"Processados {resumo['compostos']} compostos!", icon=":material/check_circle:")
             st.rerun()
+        except etl.ErroValidacao as e:
+            barra.empty()
+            st.sidebar.warning(str(e), icon=":material/warning:")
         except Exception as e:
             barra.empty()
-            st.sidebar.error(f"Erro ao processar: {e}")
+            st.sidebar.error(
+                "Não foi possível processar as planilhas. Confira se enviou os arquivos corretos.",
+                icon=":material/error:",
+            )
+            with st.sidebar.expander("Detalhes técnicos"):
+                st.code(str(e))
 
 # =========================
 # CORPO

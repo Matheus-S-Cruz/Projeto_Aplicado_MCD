@@ -42,6 +42,10 @@ TIMEOUT = 10
 session_http = requests.Session()
 
 
+class ErroValidacao(Exception):
+    """Erro amigável de validação das planilhas (mensagem exibível ao usuário)."""
+
+
 # =========================
 # CACHE
 # =========================
@@ -324,10 +328,26 @@ def processar(
 
     # 1) LEITURA
     _log("Lendo planilhas...", 0.05)
-    df_id = pd.read_excel(arquivo_identificacao)
-    df_ab = pd.read_excel(arquivo_abundancia)
+    try:
+        df_id = pd.read_excel(arquivo_identificacao)
+        df_ab = pd.read_excel(arquivo_abundancia)
+    except Exception:
+        raise ErroValidacao("Não foi possível ler as planilhas. Verifique se são arquivos .xlsx válidos.")
     df_id.columns = df_id.columns.str.strip()
     df_ab.columns = df_ab.columns.str.strip()
+
+    # validação das colunas esperadas (ex.: arquivos trocados)
+    faltando_id = [c for c in ("Compound", "Description") if c not in df_id.columns]
+    if faltando_id:
+        raise ErroValidacao(
+            f"A planilha de identificação não tem as colunas esperadas ({', '.join(faltando_id)}). "
+            "Confira se enviou o arquivo de identificação correto."
+        )
+    if "Compound" not in df_ab.columns:
+        raise ErroValidacao(
+            "A planilha de abundância não tem a coluna 'Compound'. "
+            "Confira se enviou o arquivo de abundância correto."
+        )
 
     if "Compound ID" not in df_id.columns and "Compound" in df_id.columns:
         df_id["Compound ID"] = df_id["Compound"]
@@ -336,6 +356,11 @@ def processar(
     df_id = df_id.drop_duplicates(subset=["Compound"]).dropna(subset=["Description"])
     df_ab = df_ab.drop_duplicates(subset=["Compound"])
     df = pd.merge(df_id, df_ab, on="Compound", how="inner", suffixes=("", "_ab"))
+    if df.empty:
+        raise ErroValidacao(
+            "Nenhum composto em comum entre as duas planilhas. "
+            "Verifique se os arquivos são do mesmo experimento."
+        )
     _log(f"Merge concluído: {len(df)} compostos.", 0.15)
 
     if limite:
