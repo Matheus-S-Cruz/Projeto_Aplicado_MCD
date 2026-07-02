@@ -39,6 +39,10 @@ MAX_WORKERS = 3
 DELAY = 0.05
 TIMEOUT = 10
 
+# ordem lógica das tags (para exibição/agregação)
+ORDEM_TAGS = ["Abund > 500", "Abund > 1000", "Abund > 5000", "Abund > 10000",
+              "Anova p-value <= 0.05", "Max Fold Change >= 2", "Not Fragmented", "Branco"]
+
 session_http = requests.Session()
 
 
@@ -88,7 +92,7 @@ def buscar_pubchem(nome):
     for tentativa_nome in estrategias:
         url = (
             f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
-            f"{tentativa_nome}/property/MolecularFormula,MolecularWeight,IUPACName/JSON"
+            f"{tentativa_nome}/property/MolecularFormula,MolecularWeight,IUPACName,InChIKey/JSON"
         )
         for _ in range(2):
             try:
@@ -104,10 +108,29 @@ def buscar_pubchem(nome):
                     "formula": p.get("MolecularFormula"),
                     "massa_api": p.get("MolecularWeight"),
                     "iupac": p.get("IUPACName"),
+                    "inchikey": p.get("InChIKey"),
                 }
             except Exception:
                 time.sleep(0.5)
     return {}
+
+
+def buscar_inchikey(cid):
+    """Obtém o InChIKey a partir de um CID já conhecido (requisição leve)."""
+    if not cid:
+        return None
+    try:
+        r = session_http.get(
+            f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{int(cid)}/property/InChIKey/JSON",
+            timeout=TIMEOUT,
+        )
+        if r.status_code == 200:
+            props = r.json().get("PropertyTable", {}).get("Properties", [])
+            if props:
+                return props[0].get("InChIKey")
+    except Exception:
+        pass
+    return None
 
 
 def buscar_pubchem_descricao(cid):
@@ -203,6 +226,41 @@ def buscar_chebi_via_pubchem(cid):
 
 
 # =========================
+# CLASSYFIRE (taxonomia química por estrutura)
+# =========================
+def buscar_classyfire(inchikey):
+    """Classificação química via ClassyFire, consultada pelo InChIKey.
+
+    Retorna Reino/Superclasse/Classe/Subclasse (quando a estrutura já está
+    classificada na base do ClassyFire). Vazio se não houver InChIKey/resultado.
+    """
+    if not inchikey:
+        return {}
+    try:
+        r = session_http.get(
+            f"http://classyfire.wishartlab.com/entities/{inchikey}.json",
+            timeout=20,
+            headers={"Accept": "application/json"},
+        )
+        if r.status_code != 200:
+            return {}
+        d = r.json()
+
+        def _nome(chave):
+            v = d.get(chave) or {}
+            return v.get("name") if isinstance(v, dict) else None
+
+        return {
+            "cf_kingdom": _nome("kingdom"),
+            "cf_superclasse": _nome("superclass"),
+            "cf_classe": _nome("class"),
+            "cf_subclasse": _nome("subclass"),
+        }
+    except Exception:
+        return {}
+
+
+# =========================
 # CLASSIFICAÇÃO
 # =========================
 AMINOACIDOS = [
@@ -263,23 +321,40 @@ def inferir_ionizacao(adducts):
 # =========================
 # ENRIQUECIMENTO (com cache)
 # =========================
+CACHE_VERSAO = 2  # v2 = já inclui InChIKey + ClassyFire
+
+
 def get_metadata(descricao, cache, usar_cache_apenas):
-    if descricao in cache:
-        return cache[descricao]
+    cached = cache.get(descricao)
+    if cached is not None and (usar_cache_apenas or cached.get("_v") == CACHE_VERSAO):
+        return cached
     if usar_cache_apenas:
         return {}  # modo demo: não bate na API se não estiver no cache
 
+    # UPGRADE SEGURO de entrada já existente: NÃO re-resolve o nome no PubChem
+    # (isso sofria rate limit e apagava CIDs bons). Só completa o que falta.
+    if cached is not None:
+        if cached.get("pubchem_cid"):
+            ik = cached.get("inchikey") or buscar_inchikey(cached["pubchem_cid"])
+            cf = buscar_classyfire(ik)
+            cache[descricao] = {**cached, "inchikey": ik, **cf, "_v": CACHE_VERSAO}
+        else:
+            cache[descricao] = {**cached, "_v": CACHE_VERSAO}  # já tentado antes, sem CID
+        return cache[descricao]
+
+    # entrada NOVA (nunca vista): fetch completo nome -> CID -> ...
     nome = normalizar_nome(descricao)
     if not nome:
-        cache[descricao] = {}
+        cache[descricao] = {"_v": CACHE_VERSAO}
         return {}
 
     pub = buscar_pubchem(nome)
     desc = buscar_pubchem_descricao(pub.get("pubchem_cid"))
     chebi = buscar_chebi_via_pubchem(pub.get("pubchem_cid"))
-    classif = classificar_composto(nome, chebi)
+    cf = buscar_classyfire(pub.get("inchikey"))          # taxonomia química (ClassyFire)
+    classif = classificar_composto(nome, chebi)          # heurística (fallback)
 
-    resultado = {**pub, **desc, **chebi, **classif}
+    resultado = {**pub, **desc, **chebi, **cf, **classif, "_v": CACHE_VERSAO}
     cache[descricao] = resultado
     return resultado
 
@@ -382,13 +457,20 @@ def processar(
                 metadados.append({"Description": d})
             if i % 25 == 0:
                 _log(f"Enriquecidos {i}/{len(descricoes)}...", 0.2 + 0.4 * i / max(len(descricoes), 1))
+            # salva o cache periodicamente: se o run for interrompido, o progresso é preservado
+            if not usar_cache_apenas and i > 0 and i % 50 == 0:
+                try:
+                    salvar_cache(dict(cache))
+                except Exception:
+                    pass
 
     if not usar_cache_apenas:
         salvar_cache(cache)
 
     df_meta = pd.DataFrame(metadados)
     for col in ["pubchem_cid", "formula", "massa_api", "iupac", "uso_descricao",
-                "chebi_id", "ontologia", "categoria_quimica", "metabolismo", "tipo_composto"]:
+                "chebi_id", "ontologia", "categoria_quimica", "metabolismo", "tipo_composto",
+                "inchikey", "cf_classe", "cf_subclasse", "cf_superclasse"]:
         if col not in df_meta.columns:
             df_meta[col] = np.nan
     df = pd.merge(df, df_meta, on="Description", how="left")
@@ -501,8 +583,16 @@ def _persistir(df: pd.DataFrame, reps: list[str], Session) -> dict:
                 massa_molecular=(float(row["massa_api"]) if pd.notna(row.get("massa_api")) else (float(row["Neutral mass (Da)"]) if pd.notna(row.get("Neutral mass (Da)")) else None)),
                 iupac=(str(row["iupac"]) if pd.notna(row.get("iupac")) else None),
                 descricao=(str(row["uso_descricao"]) if pd.notna(row.get("uso_descricao")) else None),
-                classe_geral=(str(row["categoria_quimica"]) if pd.notna(row.get("categoria_quimica")) else None),
-                subclasse=(row["ontologia"].split(" | ")[0] if isinstance(row.get("ontologia"), str) else None),
+                classe_geral=(
+                    str(row["cf_classe"]) if pd.notna(row.get("cf_classe"))
+                    else str(row["cf_superclasse"]) if pd.notna(row.get("cf_superclasse"))
+                    else str(row["categoria_quimica"]) if pd.notna(row.get("categoria_quimica"))
+                    else None
+                ),
+                subclasse=(
+                    str(row["cf_subclasse"]) if pd.notna(row.get("cf_subclasse"))
+                    else (row["ontologia"].split(" | ")[0] if isinstance(row.get("ontologia"), str) else None)
+                ),
                 tipo_composto=(str(row["tipo_composto"]) if pd.notna(row.get("tipo_composto")) else None),
                 metabolismo=(str(row["metabolismo"]) if pd.notna(row.get("metabolismo")) else None),
             )
@@ -543,7 +633,9 @@ def _persistir(df: pd.DataFrame, reps: list[str], Session) -> dict:
             if pd.notna(row.get("pubchem_cid")):
                 s.add(ProcedenciaCampo(compound_id=cid, campo="formula/massa/descricao", fonte="PubChem", referencia=f"CID {int(row['pubchem_cid'])}"))
             if pd.notna(row.get("chebi_id")):
-                s.add(ProcedenciaCampo(compound_id=cid, campo="ontologia/classe", fonte="ChEBI", referencia=str(row["chebi_id"])))
+                s.add(ProcedenciaCampo(compound_id=cid, campo="ontologia", fonte="ChEBI", referencia=str(row["chebi_id"])))
+            if pd.notna(row.get("cf_classe")) or pd.notna(row.get("cf_subclasse")):
+                s.add(ProcedenciaCampo(compound_id=cid, campo="classe_geral/subclasse", fonte="ClassyFire", referencia=str(row.get("inchikey") or "")))
 
             # tags derivadas da abundância (o formato simples não traz tags)
             media = row.get("media")
@@ -581,7 +673,9 @@ def _persistir(df: pd.DataFrame, reps: list[str], Session) -> dict:
 def documento_ist(Session) -> pd.DataFrame:
     """Monta a tabela final (formato Documento IST) via JOIN sobre o banco."""
     from sqlalchemy import select
-    from models import Abundancia, Amostra, Composto, MetricaComposto, RankingComposto
+    from models import (
+        Abundancia, Amostra, Composto, CompostoTag, MetricaComposto, RankingComposto, Tag,
+    )
 
     with Session() as s:
         stmt = (
@@ -613,9 +707,27 @@ def documento_ist(Session) -> pd.DataFrame:
             s.bind,
         ).rename(columns={"compound_id": "Composto", "nome": "Amostra mais abundante"})
 
+        # tags por composto (agregadas em uma string)
+        tags_df = pd.read_sql(
+            select(CompostoTag.compound_id, Tag.nome)
+            .join(Tag, Tag.id == CompostoTag.tag_id),
+            s.bind,
+        )
+
     df = df.merge(amax, on="Composto", how="left")
+
+    if not tags_df.empty:
+        tags_agg = (
+            tags_df.groupby("compound_id")["nome"]
+            .apply(lambda x: ", ".join(sorted(x, key=lambda t: ORDEM_TAGS.index(t) if t in ORDEM_TAGS else 99)))
+            .reset_index()
+            .rename(columns={"compound_id": "Composto", "nome": "Tags"})
+        )
+        df = df.merge(tags_agg, on="Composto", how="left")
+    df["Tags"] = df.get("Tags", pd.Series(index=df.index, dtype="object")).fillna("")
+
     ordem = ["Composto", "Composto ID", "Modo de aquisição", "Score", "Fragmentação",
-             "Abund. relativa", "Amostra mais abundante", "Descrição", "Classe geral",
+             "Abund. relativa", "Amostra mais abundante", "Tags", "Descrição", "Classe geral",
              "Subclasse", "Confiança", "Posição"]
     return df[[c for c in ordem if c in df.columns]]
 
