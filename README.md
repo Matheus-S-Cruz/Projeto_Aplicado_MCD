@@ -1,4 +1,4 @@
-# QuimioAnalytics / MyChemicalData
+# MyChemicalData
 
 Projeto Aplicado desenvolvido pelo grupo **My Chemical Data** para o Instituto SENAI de Tecnologia Ambiental — UniSENAI.
 
