@@ -234,7 +234,10 @@ with aba_dash:
                       "Anova p-value <= 0.05", "Max Fold Change >= 2", "Not Fragmented", "Branco"]
         tag_cont["_ord"] = tag_cont["Tag"].apply(lambda t: ordem_tags.index(t) if t in ordem_tags else 99)
         tag_cont = tag_cont.sort_values("_ord")
-        fig_tag = px.bar(tag_cont, x="Tag", y="qtd", title="Compostos por tag")
+        cores_tag = ["#a8dadc", "#6bbfbf", "#3a8f8f", "#1d5f5f"]  # claro -> escuro (troque os hex aqui)
+        fig_tag = px.bar(tag_cont, x="Tag", y="qtd", title="Compostos por tag",
+                         color="Tag", color_discrete_sequence=cores_tag)
+        fig_tag.update_layout(showlegend=False)
         g3.plotly_chart(fig_tag, width="stretch")
     else:
         g3.info("Sem tags nesta análise.")
@@ -243,7 +246,8 @@ with aba_dash:
     if "Amostra mais abundante" in df.columns:
         am = df["Amostra mais abundante"].fillna("(sem)").value_counts().reset_index()
         am.columns = ["Amostra", "qtd"]
-        fig_am = px.bar(am, x="Amostra", y="qtd", title="Compostos por amostra mais abundante")
+        fig_am = px.bar(am, x="Amostra", y="qtd", title="Compostos por amostra mais abundante",
+                        color_discrete_sequence=["#e76f51"])  # cor sólida (troque o hex aqui)
         g4.plotly_chart(fig_am, width="stretch")
 
 # ---------- SOBRE ----------
